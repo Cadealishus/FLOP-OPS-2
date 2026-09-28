@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <title>FLOP OPS</title>
+    <!-- Inline favicon: the ESF mark (amber chevron over a bar, in a square).
+         Self-contained so it never 404s. -->
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20fill='%230b0b0a'/%3E%3Cpath%20d='M3.5%209%208%204.6%2012.5%209'%20fill='none'%20stroke='%23EDB54C'%20stroke-width='1.9'/%3E%3Crect%20x='3.5'%20y='11'%20width='9'%20height='1.8'%20fill='%23EDB54C'/%3E%3C/svg%3E"
+    />
+    <style>
+      /* Type is self-hosted (src/ui/fonts, Google Fonts under the SIL OFL) so
+         the loading screen and the game never touch the network. Barlow
+         Condensed carries every label; Inter carries running copy. The HUD
+         stylesheet (src/ui/style.js) declares the same faces for the game. */
+      @font-face { font-family: "Barlow Condensed"; font-weight: 600; font-display: swap;
+        src: url("/src/ui/fonts/barlow-condensed-600.woff2") format("woff2"); }
+      @font-face { font-family: "Barlow Condensed"; font-weight: 700; font-display: swap;
+        src: url("/src/ui/fonts/barlow-condensed-700.woff2") format("woff2"); }
+      @font-face { font-family: "Inter"; font-weight: 100 900; font-display: swap;
+        src: url("/src/ui/fonts/inter-var.woff2") format("woff2"); }
+
+      :root {
+        color-scheme: dark;
+        --ink: rgba(243, 241, 235, 0.96);
+        --ink-2: rgba(232, 229, 221, 0.62);
+        --ink-3: rgba(222, 218, 208, 0.38);
+        --acc: #edb54c;
+        --cond: "Barlow Condensed", "Avenir Next Condensed", "Arial Narrow", "Liberation Sans Narrow",
+          "Helvetica Neue", system-ui, sans-serif;
+        --sans: Inter, "Helvetica Neue", "Segoe UI", Roboto, "Liberation Sans", system-ui, sans-serif;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0b0a; }
+      body { font-family: var(--cond); -webkit-font-smoothing: antialiased; }
+      #game { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: none; }
+
+      /* ================================================================ boot
+         PRE-ENGINE LOADING SCREEN.
+
+         Parsed and painted before /src/main.js has even been fetched, so the
+         engine's init long task never happens behind a black screen. The inline
+         script at the bottom of <body> owns this DOM until main.js drives it
+         through window.__BOOT__.
+
+         Layout is a mission loading card: unit mark top-left, the operation
+         bottom-left, Command's advice above a hairline progress bar. */
+      #boot {
+        position: fixed; inset: 0; z-index: 9000;
+        background:
+          radial-gradient(ellipse 70% 60% at 78% 68%, rgba(237, 181, 76, 0.07), transparent 70%),
+          linear-gradient(180deg, #0d0d0c 0%, #0a0a09 60%, #0c0b09 100%);
+        color: var(--ink);
+        opacity: 1; transition: opacity 0.42s ease-out;
+        will-change: opacity;
+      }
+      #boot.gone { opacity: 0; pointer-events: none; }
+      .boot-top {
+        position: absolute; left: 6.5vh; right: 6.5vh; top: 5.5vh;
+        display: flex; align-items: center; justify-content: space-between;
+        font-weight: 600; font-size: 1.25vh; letter-spacing: 0.3em; text-transform: uppercase;
+        color: var(--ink-2);
+      }
+      .boot-unit { display: flex; align-items: center; gap: 1vh; }
+      .boot-unit svg { width: 2.1vh; height: 2.1vh; color: var(--acc); display: block; }
+      .boot-wm { font-weight: 700; font-size: 1.9vh; letter-spacing: 0.08em; color: var(--ink); }
+      .boot-main {
+        position: absolute; left: 6.5vh; bottom: 19vh; width: min(92vw, 110vh);
+      }
+      .boot-kicker {
+        display: flex; align-items: center; gap: 1.2vh;
+        font-weight: 600; font-size: 1.3vh; letter-spacing: 0.3em; text-transform: uppercase;
+      }
+      .boot-kicker b { color: var(--acc); font-weight: 600; }
+      .boot-kicker i { width: 1px; height: 1.2vh; background: rgba(255, 255, 255, 0.18); }
+      .boot-kicker span { color: var(--ink-3); }
+      .boot-title {
+        font-weight: 700; font-size: 7.4vh; line-height: 0.92; letter-spacing: 0.03em;
+        text-transform: uppercase; margin: 1.6vh 0 1.8vh;
+      }
+      .boot-sub {
+        font-family: var(--sans); font-size: 1.75vh; line-height: 1.45; color: var(--ink-2);
+        max-width: 64vh;
+      }
+      .boot-tip {
+        position: absolute; left: 6.5vh; right: 6.5vh; bottom: 9.5vh;
+        display: flex; align-items: baseline; gap: 2.2vh;
+      }
+      .boot-tip b {
+        flex: none; font-weight: 700; font-size: 1.3vh; letter-spacing: 0.26em; color: var(--acc);
+        text-transform: uppercase;
+      }
+      #boot-tip {
+        font-family: var(--sans); font-size: 1.75vh; line-height: 1.4; color: var(--ink);
+        transition: opacity 0.3s linear; min-height: 1.4em;
+      }
+      .boot-bar {
+        position: absolute; left: 6.5vh; right: 6.5vh; bottom: 6.5vh; height: 2px;
+        background: rgba(255, 255, 255, 0.1); overflow: hidden;
+      }
+      .boot-bar > i {
+        display: block; height: 100%; width: 100%;
+        transform: scaleX(0); transform-origin: left center;
+        background: var(--acc);
+        will-change: transform;
+      }
+      .boot-row {
+        position: absolute; left: 6.5vh; right: 6.5vh; bottom: 3.4vh;
+        display: flex; justify-content: space-between; align-items: baseline;
+        font-weight: 600; font-size: 1.25vh; letter-spacing: 0.26em; text-transform: uppercase;
+      }
+      #boot-phase { color: var(--ink-2); }
+      #boot-pct { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+    </style>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <div id="ui"></div>
+
+    <div id="boot">
+      <div class="boot-top">
+        <div class="boot-unit">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="1" y="1" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.5" />
+            <path d="M6 13.5 12 8l6 5.5" fill="none" stroke="currentColor" stroke-width="2.2" />
+            <rect x="6" y="16" width="12" height="2.2" fill="currentColor" />
+          </svg>
+          <span>EXTRA SPECIAL FORCES</span>
+        </div>
+        <div class="boot-wm">FLOP OPS</div>
+      </div>
+
+      <div class="boot-main">
+        <div class="boot-kicker"><b>MISSION 01</b><i></i><span>BORDER TOWN · CENTRAL SQUARE</span></div>
+        <div class="boot-title">OPERATION<br />TOTAL CONFIDENCE</div>
+        <div class="boot-sub">
+          Hold the town square for as long as it takes. Command estimates this will take about a wave.
+        </div>
+      </div>
+
+      <div class="boot-tip"><b>COMMAND ADVISES</b><span id="boot-tip">If you are taking fire, consider not being where the fire is.</span></div>
+      <div class="boot-bar"><i id="boot-fill"></i></div>
+      <div class="boot-row">
+        <span id="boot-phase">ESTABLISHING UPLINK</span>
+        <span id="boot-pct">0%</span>
+      </div>
+    </div>
+
+    <script>
+      /**
+       * Loading-screen driver. Deliberately a classic (non-module) inline
+       * script: it runs during parse, before the deferred module graph is even
+       * fetched, so the bar exists and the tips rotate while the engine module
+       * is still evaluating. `main.js` takes over by calling window.__BOOT__.set
+       * from every `boot:progress` event; nothing else here talks to the engine.
+       *
+       * The caption is derived from progress, not from the engine's own phase
+       * names, so the loading screen stays in Command's voice whatever the
+       * engine calls its subsystems.
+       *
+       * No RNG anywhere — the tip order is a fixed rotation, so a capture is
+       * reproducible and two players see the same first line.
+       */
+      (function () {
+        var root = document.getElementById('boot');
+        var fill = document.getElementById('boot-fill');
+        var phase = document.getElementById('boot-phase');
+        var pctEl = document.getElementById('boot-pct');
+        var tipEl = document.getElementById('boot-tip');
+
+        /* Command's loading advice. Rotated in this exact order. */
+        var TIPS = [
+          'If you are taking fire, consider not being where the fire is.',
+          'Reloading takes less time than being shot. Plan accordingly.',
+          'Headshots are worth more. Command does not make the rules. Command makes most of the rules.',
+          '"About a wave" is an estimate. Estimates are not promises. Command wishes to stress this.',
+          'Cover is anything between you and the enemy. The enemy has read the same manual.',
+          'Your health regenerates if you stop getting shot. So does Command’s patience, more slowly.',
+          'Sprinting is faster than walking. This has been confirmed by testing.',
+          'The square has been held before. Not by us, but it has been held.',
+          'Extra Special Forces are not special forces. They are extra special. There is a form.',
+          'Hostiles are hostile. Command apologises for any confusion in previous briefings.',
+        ];
+
+        /* Progress-banded captions: [from pct, caption]. */
+        var PHASES = [
+          [0.0, 'ESTABLISHING UPLINK'],
+          [0.12, 'SURVEYING THE TOWN'],
+          [0.28, 'LOCATING THE SQUARE'],
+          [0.44, 'ISSUING WEAPONS'],
+          [0.58, 'BRIEFING HOSTILES'],
+          [0.72, 'CONFIRMING CONFIDENCE'],
+          [0.88, 'FINALISING THE ESTIMATE'],
+        ];
+
+        var capture = false;
+        try {
+          capture = /(^|[?&])capture=1(&|$)/.test(location.search);
+        } catch (e) {
+          /* no location (never in a browser, but keep the driver total) */
+        }
+
+        // Capture harness: the screenshot must frame the game, never a loading
+        // overlay, and the deterministic frame budget must not pay for a fade.
+        if (capture) {
+          root.style.display = 'none';
+          window.__BOOT__ = { set: function () {}, done: function () {}, fail: function () {} };
+          return;
+        }
+
+        var shown = 0;
+        var tipTimer = setInterval(function () {
+          shown = (shown + 1) % TIPS.length;
+          tipEl.style.opacity = '0';
+          setTimeout(function () {
+            tipEl.textContent = TIPS[shown];
+            tipEl.style.opacity = '1';
+          }, 300);
+        }, 3600);
+
+        var last = 0;
+        var lastPhase = -1;
+        var finished = false;
+
+        function stop() {
+          if (tipTimer) clearInterval(tipTimer);
+          tipTimer = null;
+        }
+
+        window.__BOOT__ = {
+          /** @param {number} pct 0..1, monotonic. The engine's caption is ignored. */
+          set: function (pct) {
+            if (finished) return;
+            var p = pct > 1 ? 1 : pct < 0 ? 0 : pct;
+            if (p > last) {
+              last = p;
+              fill.style.transform = 'scaleX(' + p.toFixed(4) + ')';
+              pctEl.textContent = Math.round(p * 100) + '%';
+            }
+            var i = 0;
+            while (i + 1 < PHASES.length && last >= PHASES[i + 1][0]) i++;
+            if (i !== lastPhase) {
+              lastPhase = i;
+              phase.textContent = PHASES[i][1];
+            }
+          },
+          /** Boot finished: land on 100%, fade out, drop the node. */
+          done: function () {
+            if (finished) return;
+            finished = true;
+            stop();
+            fill.style.transform = 'scaleX(1)';
+            pctEl.textContent = '100%';
+            phase.textContent = 'CLEARED TO DEPLOY';
+            root.classList.add('gone');
+            setTimeout(function () {
+              if (root.parentNode) root.parentNode.removeChild(root);
+            }, 500);
+          },
+          /** Boot threw: get out of the way so the error is legible. */
+          fail: function () {
+            finished = true;
+            stop();
+            root.style.display = 'none';
+          },
+        };
+      })();
+    </script>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
