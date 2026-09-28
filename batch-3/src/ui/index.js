@@ -1,0 +1,1053 @@
+import * as THREE from 'three';
+import { installStyles, removeStyles } from './style.js';
+import { el, clamp, clamp01, damp, setStyle } from './util.js';
+import { Crosshair } from './crosshair.js';
+import { Hitmarkers } from './hitmarkers.js';
+import { DamageArcs } from './damage.js';
+import { HealthFx } from './health.js';
+import { AmmoPanel } from './ammo.js';
+import { Killfeed } from './killfeed.js';
+import { Compass, RunBar } from './compass.js';
+import { Minimap } from './minimap.js';
+import { WorldMarkers } from './markers.js';
+import { Prompt, Banner, ScorePop } from './prompts.js';
+import { PauseMenu } from './menu.js';
+import { CombatDemo } from './demo.js';
+import { FrontEndScreen, DeathScreen, GameOverScreen, LOADOUTS } from './screens.js';
+import { RadioSubs } from './radio.js';
+
+/**
+ * No callsign table here, deliberately. Every live hostile carries its own
+ * `agent.name` (callsign) and `agent.variantDisplay` (role), and both ride on
+ * the payloads this subsystem receives. The killfeed reads those. If a payload
+ * has no name, the row says so or is dropped — it does not guess.
+ */
+
+const MAX_BLIPS = 48;
+
+/** Title backdrop dolly: start point and unit direction down the main street. */
+const TITLE_CAM = { from: [12, 1.9, 18], dir: [-0.5547, 0, -0.8321], fov: 62 };
+
+/** How stale the last enemy round may be and still be blamed for your death. */
+const ATTACKER_MEMORY_S = 6;
+
+/** Health fraction under which Command comments on Doug's condition. */
+const HURT_RADIO_FRAC = 0.35;
+
+/** Score callout copy. Deadpan, uppercase, short enough to read mid-fight. */
+const CALLOUT = {
+  kill: 'HOSTILE NEUTRALISED',
+  head: 'HEADSHOT. NOTED.',
+};
+
+/**
+ * ===========================================================================
+ * HUD / UI subsystem
+ * ===========================================================================
+ *
+ * A DOM+CSS overlay (see style.js for the design system) driven entirely from
+ * `lateUpdate`, after the camera has reached its final transform for the frame.
+ * Nothing animates on a CSS keyframe or transition: every value is integrated
+ * from `dt` here, which is what makes the capture harness deterministic and
+ * lets the whole HUD freeze correctly when the game is paused.
+ *
+ * ---------------------------------------------------------------------------
+ * PUBLIC API — `const ui = ctx.get('ui')`
+ * ---------------------------------------------------------------------------
+ *   ui.hitmarker(kind)                  'hit' | 'armour' | 'head' | 'kill'
+ *   ui.damageNumber(worldPos, n, kind)  'hit' | 'hs' | 'armour' | 'kill'
+ *   ui.hurt(amount, dirX, dirZ)         directional arc + flash + flinch
+ *   ui.killfeed.push({attacker,attackerVariant,victim,victimVariant,headshot,
+ *                     mine,attackerFriendly})  |  ui.killfeed.push({note})
+ *   ui.banner.show(title, sub, life, kind)  wave / objective banner
+ *   ui.radio.say(kind, vars)            Command radio subtitle (radio.js)
+ *   ui.scorePop.push(label, pts, kind)  score callout under the reticle
+ *   ui.setPrompt({key,text,sub,progress}) / ui.clearPrompt()
+ *   ui.setObjectives([{position,label,name}])
+ *   ui.setBlips([{x,z,kind:'enemy'|'friend',heading}])
+ *   ui.spawnGrenade(worldPos, fuse)
+ *   ui.setMatch({scoreUs,scoreThem,timeLeft,mode})
+ *   ui.setHudVisible(bool)              hide everything (cinematics)
+ *   ui.pause() / ui.resume() / ui.menu.toggle()
+ *   ui.debugState('combat'|'menu'|'clean'|'title'|'death'|'radio')
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS SUBSYSTEM READS FROM OTHERS (all optional, all duck-typed)
+ * ---------------------------------------------------------------------------
+ *   weapons.getHudState() -> { name, mode, ammo, reserve, magSize, reloading,
+ *                              reloadProgress, ads, spread, lethalCount,
+ *                              tacticalCount }
+ *   player.getHudState()  -> { health, maxHealth, armour, maxArmour, regen,
+ *                              move, sprint, crouch, ads, airborne, position }
+ *                            (or plain `player.health` / `player.position`)
+ *   ai.agents             -> live Agent[]; read `.alive`, `.position`, `.yaw`,
+ *                            `.name` (callsign) and `.variantDisplay` (rank)
+ *   audio.playUi(id, gain) | audio.play(id) — hit ticks, heartbeat, warnings
+ *
+ * Events consumed: weapon:fire, weapon:reload, damage:dealt, damage:taken,
+ * player:death, player:state, explosion, resize, game:*.
+ * Events emitted:  ui:pause, ui:quality, ui:sensitivity, ui:fov, ui:setting,
+ *                  ui:startRun, ui:continue, ui:accept, ui:restart, ui:attract.
+ */
+export class UiSystem {
+  static id = 'ui';
+  static deps = ['render'];
+
+  async init(ctx) {
+    this.ctx = ctx;
+    this.rng = ctx.rng.fork();
+    installStyles();
+
+    const host = document.getElementById('ui') ?? document.body;
+    this.root = el('div', 'ow-hud', host);
+
+    // Stacking order: hurt overlays sit under the HUD, the menu over everything.
+    this.hurtLayer = el('div', 'ow-layer', this.root);
+    this.worldLayer = el('div', 'ow-layer', this.root);
+    this.centreLayer = el('div', 'ow-layer', this.root);
+    this.chromeLayer = el('div', 'ow-layer', this.root);
+
+    this.health = new HealthFx(this.hurtLayer, this.chromeLayer);
+    this.markers = new WorldMarkers(this.worldLayer, this.rng.fork());
+    this.arcs = new DamageArcs(this.centreLayer);
+    this.crosshair = new Crosshair(this.centreLayer);
+    this.hit = new Hitmarkers(this.centreLayer);
+    this.minimap = new Minimap(this.chromeLayer, this.rng.fork());
+    this.compass = new Compass(this.chromeLayer);
+    this.runBar = new RunBar(this.chromeLayer);
+    this.killfeed = new Killfeed(this.chromeLayer);
+    this.ammo = new AmmoPanel(this.chromeLayer);
+    this.prompt = new Prompt(this.chromeLayer);
+    this.banner = new Banner(this.chromeLayer);
+    this.scorePop = new ScorePop(this.centreLayer);
+
+    // Front-end screens (over the HUD chrome, under the radio and pause menu).
+    this.attract = new FrontEndScreen(this.root, (id) => this._startRun(id), ctx);
+    this.death = new DeathScreen(this.root, {
+      onContinue: () => {
+        this.death.hide();
+        this.radio.say('continue', null, { force: true });
+        ctx.events.emit('ui:continue', {});
+        ctx.input?.requestPointerLock?.();
+      },
+      onAccept: () => {
+        ctx.events.emit('ui:accept', {});
+      },
+    });
+    this.over = new GameOverScreen(this.root, {
+      onRestart: () => {
+        this.over.hide();
+        this._resetRunState();
+        ctx.events.emit('ui:restart', {});
+        ctx.input?.requestPointerLock?.();
+      },
+      onReturn: () => {
+        this.over.hide();
+        ctx.events.emit('ui:attract', {});
+      },
+    });
+
+    // Command's radio net sits over the screens: DOUG IS DOWN is exactly when
+    // Command has something to say.
+    this.radioLayer = el('div', 'ow-layer', this.root);
+    this.radio = new RadioSubs(this.radioLayer, this.rng.fork());
+
+    /** Killer of the last death, `RIFLEMAN ▸ VIPER 2`, for the down screen. */
+    this._killer = null;
+    /** Next game:wave is the restart after a continue, not a new wave. */
+    this._continuing = false;
+    /** Score delta from the kill currently being processed (game:score). */
+    this._killDelta = 0;
+    this._killDeltaFrame = -1;
+    this._hurtArmed = true;
+    /** Shot pinned by debugState so `shot:applied` does not clear it. */
+    this._pin = null;
+    /** Front-end screen that owns the frame (see _syncScreen). */
+    this._screen = undefined;
+    this._dolly = 0;
+
+    this.menu = new PauseMenu(this.root, ctx);
+
+    this.health.onBeat = (i) => this.sfx('heartbeat', 0.35 + i * 0.5);
+
+    /** Single source of truth for everything the HUD draws. */
+    this.state = {
+      health: 100,
+      maxHealth: 100,
+      armour: 0,
+      maxArmour: 150,
+      regen: false,
+      ammo: 30,
+      reserve: 210,
+      magSize: 30,
+      reloading: false,
+      reloadProgress: 0,
+      weaponName: 'ASSAULT RIFLE',
+      fireMode: 'AUTO',
+      lethalCount: 2,
+      tacticalCount: 1,
+      move: 0,
+      sprint: false,
+      crouch: false,
+      ads: false,
+      airborne: false,
+      baseSpread: 5.5,
+      mode: 'OPERATION TOTAL CONFIDENCE',
+      // ---- run state (driven by game:* events) ----
+      wave: 1,
+      score: 0,
+      mult: 1,
+      waveThreat: 'HOLD THE SQUARE',
+      job: null,
+      /** true when no player/weapons subsystem is driving us (stub-safe demo) */
+      simulate: false,
+      time: 0,
+    };
+
+    this.k = 1;
+    this.vw = 1920;
+    this.vh = 1080;
+    this.hudVisible = 1;
+    this.hudTarget = 1;
+    this._lastRaw = ctx.time.raw;
+    /** Time of your last confirmed kill. Read by nothing right now — kept
+     *  because it is the honest hook for any future "kills within N seconds"
+     *  feedback, and it costs one number. */
+    this._lastKillAt = -10;
+    /** Freshest enemy that put a round in the player — the death row's source. */
+    this._lastAttacker = null;
+    this._lastAttackerAt = -1e9;
+    this._regenTimer = 0;
+    this._hadPointerLock = false;
+    this._bakeFrame = 0;
+
+    this._pos = new THREE.Vector3();
+    this._prevPos = new THREE.Vector3();
+    this._dir = new THREE.Vector3();
+    this._tmp = new THREE.Vector3();
+    this._objectives = [];
+    this._compassObjs = [];
+    this._blips = new Array(MAX_BLIPS);
+    for (let i = 0; i < MAX_BLIPS; i++) this._blips[i] = { x: 0, z: 0, kind: 'enemy', heading: 0 };
+    this._blipCount = 0;
+    this._blipView = [];
+
+    this.demo = null;
+
+    this._unsubs = [];
+    const on = (type, fn) => this._unsubs.push(ctx.events.on(type, fn));
+    // Enemy radio chatter from src/ai/radio.js, subtitled under the callsign.
+    on('ai:radio', (e) => this.radio?.hostile?.(e?.enemy?.name, e?.text));
+
+    on('weapon:fire', (e) => {
+      this.crosshair.onFire(e?.recoil ?? 1);
+      if (this.state.simulate) return;
+      const w = this._weaponState();
+      if (!w) this.state.ammo = Math.max(0, this.state.ammo - 1);
+    });
+
+    on('weapon:reload', (e) => {
+      const s = this.state;
+      if (e?.phase === 'start') {
+        s.reloading = true;
+        s.reloadProgress = 0;
+      } else if (e?.phase === 'end') {
+        s.reloading = false;
+        if (!this._weaponState()) {
+          const take = Math.min(s.magSize - s.ammo, s.reserve);
+          s.ammo += take;
+          s.reserve -= take;
+        }
+      }
+    });
+
+    on('damage:dealt', (e) => {
+      if (!e) return;
+      // The payload means "damage dealt TO e.target". `ai` uses it for enemy
+      // rounds that connect with the player, which must not draw a hitmarker or
+      // a "YOU killed" killfeed row — that arrives as `damage:taken` below.
+      if (this._isPlayerTarget(e.target)) {
+        // …but it IS the only truthful attacker data in the game: src/ai puts
+        // the firing soldier on the round it sends at you (`source: agent`).
+        // Stash the freshest one so the death row can name who actually did it
+        // instead of inventing somebody.
+        if (e.source) {
+          this._lastAttacker = e.source;
+          this._lastAttackerAt = ctx.time.elapsed;
+        }
+        return;
+      }
+      const kind = e.killed ? 'kill' : e.headshot ? 'head' : e.armour ? 'armour' : 'hit';
+      this.hitmarker(kind);
+      if (e.point) {
+        this.damageNumber(
+          e.point,
+          e.amount ?? 0,
+          e.killed ? 'kill' : e.headshot ? 'hs' : e.armour ? 'armour' : 'hit'
+        );
+      }
+      if (e.killed) {
+        this._lastKillAt = ctx.time.elapsed;
+        // `RIFLEMAN ▸ VIPER 2`: role and callsign, both read off the Agent that
+        // just died. No fallback rotation.
+        this.killfeed.push({
+          attacker: 'DOUG',
+          victim: e.target?.name ?? e.name ?? null,
+          victimVariant: e.target?.variantDisplay ?? null,
+          headshot: !!e.headshot,
+          mine: true,
+        });
+        // The game's own score delta for this kill arrives on game:score from
+        // inside the same event cascade (ai → actor:death → game), before this
+        // handler runs. Fall back to the base value when no game drives score.
+        const fresh = this._killDeltaFrame === ctx.time.frame && this._killDelta > 0;
+        const pts = fresh ? this._killDelta : (e.headshot ? 150 : 100) * Math.max(1, this.state.mult | 0);
+        this._killDeltaFrame = -1;
+        this.scorePop.push(e.headshot ? CALLOUT.head : CALLOUT.kill, pts, e.headshot ? 'head' : 'kill');
+        if (!this.ctx.peek('game')) this.state.score += e.headshot ? 150 : 100;
+      }
+    });
+
+    on('damage:taken', (e) => {
+      const amount = e?.amount ?? 10;
+      if (e?.health !== undefined) this.state.health = e.health;
+      else this.state.health = Math.max(0, this.state.health - amount);
+      let dx = 0;
+      let dz = 1;
+      if (e?.from) {
+        this._tmp.copy(e.from).sub(this._playerPos());
+        dx = this._tmp.x;
+        dz = this._tmp.z;
+      }
+      this.hurt(amount, dx, dz);
+    });
+
+    // There is no `actor:death` killfeed row: its payload names no killer.
+    // Kills Doug makes are credited from `damage:dealt` above; the round that
+    // kills Doug is credited from its `source` on `player:death` below.
+
+    on('player:death', () => {
+      const a = this._lastAttacker;
+      const fresh = a && ctx.time.elapsed - this._lastAttackerAt < ATTACKER_MEMORY_S;
+      this._lastAttacker = null;
+      this._killer = null;
+      if (!fresh || !a.name) return; // fell, drowned, unattributable — say nothing
+      this._killer = (a.variantDisplay ? String(a.variantDisplay).toUpperCase() + ' ▸ ' : '') + String(a.name).toUpperCase();
+      this.killfeed.push({
+        attacker: a.name,
+        attackerVariant: a.variantDisplay ?? null,
+        victim: 'DOUG',
+        attackerFriendly: false,
+        mine: true,
+      });
+    });
+
+    // Two or more kills inside the 1.2 s window (src/game/scoring.js). A feed
+    // note, not a banner; three or more and Command notices.
+    on('game:multiKill', (e) => {
+      const n = Math.max(2, Math.round(e?.count ?? 2));
+      const note = n === 2 ? 'DOUBLE KILL · NOTED' : n === 3 ? 'TRIPLE KILL · NOTED' : n + ' AT ONCE · COMMAND IS CONCERNED';
+      this.killfeed.push({ note, mine: true });
+      this.sfx('hit_kill', 0.9);
+      if (n >= 3) this.radio.say('streak', { m: Math.max(1, this.state.mult | 0) });
+    });
+
+    on('explosion', (e) => {
+      if (!e?.position) return;
+      this._tmp.copy(e.position).sub(this._playerPos());
+      const d = this._tmp.length();
+      if (d < (e.radius ?? 6) * 2.5) this.crosshair.onFlinch(0.6);
+    });
+
+    on('player:state', (e) => {
+      if (!e) return;
+      const s = this.state;
+      if (e.ads !== undefined) s.ads = !!e.ads;
+      if (e.sprinting !== undefined) s.sprint = !!e.sprinting;
+      if (e.stance !== undefined) s.crouch = e.stance === 'crouch' || e.stance === 'prone';
+    });
+
+    // ==================================================================== //
+    // OPERATION TOTAL CONFIDENCE (src/game, id `game`). All optional: if the
+    // game subsystem never emits, the title screen alone still releases the
+    // player into the running game.
+    // ==================================================================== //
+    on('game:state', (e) => this._setGameState(e?.state));
+
+    on('game:wave', (e) => {
+      const wave = e?.wave ?? this.state.wave ?? 1;
+      const count = e?.count;
+      this.state.wave = wave;
+      this.state.waveThreat = 'HOLD THE SQUARE';
+      const sub = count ? count + ' HOSTILES INBOUND' : 'HOSTILES INBOUND';
+      this.banner.show('WAVE ' + wave, sub, 2.6, 'threat');
+      this.sfx('wave_start', 0.7);
+      if (this._continuing) {
+        this._continuing = false; // Command already spoke on the continue
+      } else {
+        this.radio.say(wave <= 1 ? 'deploy' : 'wave', { n: wave });
+      }
+    });
+
+    on('game:waveClear', (e) => {
+      const wave = e?.wave ?? this.state.wave ?? 1;
+      const bonus = Math.max(0, Math.round(e?.bonus ?? 0));
+      this.banner.show('WAVE ' + wave + ' HELD', 'SQUARE SECURE  +' + bonus.toLocaleString('en-US'), 2.8, 'clear');
+      this.sfx('wave_clear', 0.8);
+      this.radio.say('clear', { n: wave });
+    });
+
+    on('game:score', (e) => {
+      if (e?.score !== undefined) this.state.score = e.score;
+      if (e?.mult !== undefined) this.state.mult = e.mult;
+      if (e?.delta > 0) {
+        this._killDelta = e.delta;
+        this._killDeltaFrame = ctx.time.frame;
+      }
+    });
+
+    on('game:mult', (e) => {
+      if (e?.mult === undefined) return;
+      const up = e.mult > (this.state.mult | 0);
+      this.state.mult = e.mult;
+      if (up && e.mult >= 3) this.radio.say('streak', { m: e.mult });
+    });
+
+    on('game:continueOffer', () => {
+      this._setGameState('down');
+      this.death.show({ canContinue: true, killer: this._killer });
+    });
+
+    on('ui:continue', () => {
+      this._continuing = true;
+      this._hurtArmed = true;
+    });
+
+    on('game:over', (e) => {
+      this.death.hide();
+      this.attract.hide();
+      this.over.show(e ?? {});
+      this._releasePointer();
+      this.sfx('run_over', 0.8);
+      this.radio.say('over', null, { force: true });
+    });
+
+    // Capture harness applies a camera shot; clear the attract/end overlays so
+    // world + combat shots frame the game, not a menu. (Unknown `default` shot
+    // returns before emitting this, so the title screen still captures clean.)
+    on('shot:applied', () => {
+      if (this._pin !== 'title') this.attract.hide();
+      if (this._pin !== 'death') this.death.hide();
+      this.over.hide();
+    });
+
+    this.resize(ctx.canvas.clientWidth || innerWidth, ctx.canvas.clientHeight || innerHeight, ctx);
+    this._prevPos.copy(this._playerPos());
+
+    // Boot straight into the title screen (no game subsystem required).
+    this.attract.setBest(this._bestRecord());
+    this.attract.show(true);
+  }
+
+  /* ------------------------------------------------------------- helpers -- */
+
+  _weaponState() {
+    const w = this.ctx.peek('weapons');
+    if (!w) return null;
+    const s = typeof w.getHudState === 'function' ? w.getHudState() : w.hudState ?? null;
+    return s && typeof s === 'object' ? s : null;
+  }
+
+  /** True when a `damage:dealt` payload is aimed at the local player. */
+  _isPlayerTarget(t) {
+    if (!t) return false;
+    return t === 'player' || t === this.ctx.peek('player') || t.isPlayer === true;
+  }
+
+  _playerState() {
+    const p = this.ctx.peek('player');
+    if (!p) return null;
+    const s = typeof p.getHudState === 'function' ? p.getHudState() : p.hudState ?? null;
+    return s && typeof s === 'object' ? s : null;
+  }
+
+  _playerPos() {
+    const p = this.ctx.peek('player');
+    const pos = p?.position ?? p?.getPosition?.();
+    if (pos && pos.isVector3) return this._pos.copy(pos);
+    return this._pos.copy(this.ctx.camera.position);
+  }
+
+  /** Fire-and-forget audio; the audio subsystem may not exist yet. */
+  sfx(id, gain = 1) {
+    const a = this.ctx.peek('audio');
+    if (!a) return;
+    try {
+      if (typeof a.playUi === 'function') a.playUi(id, gain);
+      else if (typeof a.play === 'function') a.play(id, { gain });
+      else if (typeof a.sfx === 'function') a.sfx(id, gain);
+    } catch {
+      /* audio is optional feedback — never let it break the HUD */
+    }
+  }
+
+  /* ------------------------------------------------------ game loop glue -- */
+
+  _resetRunState() {
+    const s = this.state;
+    s.wave = 1;
+    s.score = 0;
+    s.mult = 1;
+    s.waveThreat = 'HOLD THE SQUARE';
+    this._killer = null;
+    this._continuing = false;
+    this._hurtArmed = true;
+  }
+
+  /** Weapon designations from src/weapons (def.displayName). Menu-time only. */
+  _loadoutInfo() {
+    const w = this.ctx.peek('weapons');
+    if (typeof w?.loadoutInfo !== 'function') return null;
+    if (!this._loadoutCache) this._loadoutCache = w.loadoutInfo();
+    return this._loadoutCache;
+  }
+
+  _weaponName(id) {
+    return this._loadoutInfo()?.find((x) => x.id === id)?.displayName ?? null;
+  }
+
+  /** Local best from src/game, for the title footer. */
+  _bestRecord() {
+    const g = this.ctx.peek('game');
+    return typeof g?.bestRecord === 'function' ? g.bestRecord() : null;
+  }
+
+  /** A screen is up: give the player their cursor back, and do not read the
+   *  lost lock as "open the pause menu". */
+  _releasePointer() {
+    this._hadPointerLock = false;
+    try {
+      if (document.pointerLockElement) document.exitPointerLock?.();
+    } catch {
+      /* not eligible — nothing to release */
+    }
+  }
+
+  /** Loadout card clicked on the title screen → deploy into the run. */
+  _startRun(id) {
+    this.attract.hide();
+    this.death.hide();
+    this.over.hide();
+    this.radio.clear();
+    this._resetRunState();
+    const L = LOADOUTS.find((l) => l.id === id) ?? LOADOUTS[0];
+    this.state.job = L.id;
+    this.state.weaponName = this._weaponName(L.weapon) ?? L.role;
+    this.ctx.events.emit('ui:startRun', { job: this.state.job });
+    // Hand off to the game's click-to-lock flow (this call is inside the gesture).
+    this.ctx.input?.requestPointerLock?.();
+  }
+
+  /** Reflect `game:state` transitions onto the screens and the radio. */
+  _setGameState(state) {
+    switch (state) {
+      case 'attract':
+        this.death.hide();
+        this.over.hide();
+        this.radio.clear();
+        this._resetRunState();
+        this.attract.setBest(this._bestRecord());
+        this.attract.setWeaponNames(this._loadoutInfo());
+        this.attract.show();
+        this._releasePointer();
+        break;
+      case 'play':
+        this.attract.hide();
+        this.death.hide();
+        this.over.hide();
+        break;
+      case 'down':
+        this.attract.hide();
+        this.over.hide();
+        if (!this.death.open) {
+          this.death.show({ canContinue: false, killer: this._killer });
+        }
+        this._releasePointer();
+        this.radio.say('down', null, { force: true });
+        break;
+      case 'over':
+        this.attract.hide();
+        this.death.hide();
+        if (!this.over.open) this.over.show();
+        this._releasePointer();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /* ---------------------------------------------------------------- api --- */
+
+  hitmarker(kind = 'hit') {
+    this.hit.spawn(kind);
+    this.crosshair.onHit();
+    this.sfx(
+      kind === 'kill' ? 'hit_kill' : kind === 'head' ? 'hit_head' : kind === 'armour' ? 'hit_armour' : 'hit_flesh',
+      kind === 'kill' ? 1 : 0.7
+    );
+  }
+
+  damageNumber(worldPos, amount, kind = 'hit') {
+    this.markers.spawnDamage(worldPos, amount, kind);
+  }
+
+  /** Incoming damage: arc toward the source, screen flash, reticle flinch. */
+  hurt(amount = 10, dirX = 0, dirZ = 1) {
+    const i = clamp01(amount / 40);
+    this.arcs.spawn(dirX, dirZ, 0.45 + i * 0.55);
+    this.health.onDamage(i);
+    this.crosshair.onFlinch(0.5 + i);
+    this._regenTimer = 0;
+    this.state.regen = false;
+    this.sfx('player_hurt', 0.6 + i * 0.4);
+  }
+
+  setPrompt(p) {
+    this.prompt.set(p);
+  }
+
+  clearPrompt() {
+    this.prompt.clear();
+  }
+
+  setObjectives(list) {
+    this._objectives = list ?? [];
+  }
+
+  addObjective(o) {
+    this._objectives.push(o);
+  }
+
+  removeObjective(id) {
+    const i = this._objectives.findIndex((o) => o.id === id);
+    if (i >= 0) this._objectives.splice(i, 1);
+  }
+
+  /** Copies into a preallocated array — the caller's array is not retained. */
+  setBlips(list) {
+    const n = Math.min(list?.length ?? 0, MAX_BLIPS);
+    for (let i = 0; i < n; i++) {
+      const src = list[i];
+      const dst = this._blips[i];
+      dst.x = src.x ?? src.position?.x ?? 0;
+      dst.z = src.z ?? src.position?.z ?? 0;
+      dst.kind = src.kind ?? (src.friendly ? 'friend' : 'enemy');
+      dst.heading = src.heading ?? 0;
+    }
+    this._blipCount = n;
+  }
+
+  spawnGrenade(worldPos, fuse = 2.4) {
+    this.markers.spawnGrenade(worldPos, fuse);
+    this.sfx('grenade_warn', 0.6);
+  }
+
+  setMatch(m) {
+    Object.assign(this.state, m);
+  }
+
+  setHudVisible(v) {
+    this.hudTarget = v ? 1 : 0;
+  }
+
+  pause() {
+    this.menu.show();
+  }
+
+  resume() {
+    this.menu.close();
+  }
+
+  /* --------------------------------------------------------------- debug -- */
+
+  /**
+   * Populate a representative state for screenshots / critics.
+   * 'combat' runs the scripted firefight timeline in demo.js.
+   */
+  debugState(name = 'combat') {
+    // Any debug state means "not on the front-end screens" unless the state is
+    // one of the screens — clear them so the harness frames what was asked for.
+    this.attract.hide();
+    this.death.hide();
+    this.over.hide();
+    this._pin = null;
+    if (name === 'clean') {
+      this.demo?.stop(this);
+      this.demo = null;
+      this.state.simulate = false;
+      this.killfeed.clear();
+      this.arcs.clear();
+      this.hit.clear();
+      this.markers.clear();
+      this.scorePop.clear();
+      this.radio.clear();
+      this.clearPrompt();
+      return { state: 'clean' };
+    }
+    if (name === 'menu') {
+      this.debugState('combat');
+      this.menu.show();
+      return { state: 'menu' };
+    }
+    if (name === 'title') {
+      this._pin = 'title';
+      this.attract.setBest({ score: 18450, wave: 4 });
+      this.attract.setWeaponNames(this._loadoutInfo());
+      this.attract.show(true);
+      this.hudVisible = 0;
+      return { state: 'title' };
+    }
+    if (!this.demo) this.demo = new CombatDemo();
+    this.demo.start(this);
+    if (name === 'radio') {
+      // Mid-wave, with Command on the net.
+      this.radio.sayExact(
+        'command',
+        'Doug, we have revised the estimate from "about a wave" to "about another wave".',
+        'Copy.'
+      );
+      return { state: 'radio' };
+    }
+    if (name === 'death') {
+      this._pin = 'death';
+      this.demo.stop(this);
+      this.state.simulate = true;
+      this.state.health = 0;
+      this.health.hurt = 0.85;
+      this.scorePop.clear();
+      this.hit.clear();
+      this.markers.clear();
+      this.killfeed.push({ attacker: 'VIPER 2', attackerVariant: 'RIFLEMAN', victim: 'DOUG', attackerFriendly: false, mine: true });
+      this.death.show({ canContinue: true, killer: 'RIFLEMAN ▸ VIPER 2' });
+      this.death.shown = 1;
+      this.radio.sayExact('command', 'Doug is down. Repeat, Doug is down. Command is going to need a moment.', 'Ow.', 4);
+      return { state: 'death' };
+    }
+    return { state: 'combat', frames: 'timeline keyed to frame 90' };
+  }
+
+  /* -------------------------------------------------------------- frame --- */
+
+  lateUpdate(dt, ctx) {
+    const t = ctx.time;
+    const rawDt = clamp(t.raw - this._lastRaw, 0, 0.1);
+    this._lastRaw = t.raw;
+    const s = this.state;
+    s.time = t.elapsed;
+
+    // ---- pause -----------------------------------------------------------
+    if (ctx.input.enabled && !ctx.input.frozen) {
+      if (ctx.input.actionPressed('pause')) this.menu.toggle();
+      // Losing pointer lock mid-match is the same intent as pressing Escape.
+      if (ctx.input.pointerLocked) this._hadPointerLock = true;
+      else if (this._hadPointerLock && !this.menu.open && !this._screenOpen()) {
+        this._hadPointerLock = false;
+        this.menu.show();
+      }
+    }
+    this.menu.update(rawDt);
+
+    // ---- external state --------------------------------------------------
+    // `simulate` means a scripted debug timeline owns the HUD numbers; letting
+    // the live weapon/player state through would fight it every frame.
+    const ws = s.simulate ? null : this._weaponState();
+    if (ws) {
+      if (ws.name) s.weaponName = ws.name;
+      if (ws.mode) s.fireMode = ws.mode;
+      if (ws.ammo !== undefined) s.ammo = ws.ammo;
+      if (ws.reserve !== undefined) s.reserve = ws.reserve;
+      if (ws.magSize !== undefined) s.magSize = ws.magSize;
+      if (ws.reloading !== undefined) s.reloading = !!ws.reloading;
+      if (ws.reloadProgress !== undefined) s.reloadProgress = ws.reloadProgress;
+      if (ws.ads !== undefined) s.ads = !!ws.ads;
+      if (ws.spread !== undefined) s.baseSpread = 4 + ws.spread * 40;
+      if (ws.lethalCount !== undefined) s.lethalCount = ws.lethalCount;
+      if (ws.tacticalCount !== undefined) s.tacticalCount = ws.tacticalCount;
+    }
+
+    const ps = s.simulate ? null : this._playerState();
+    const player = ctx.peek('player');
+    if (ps) {
+      if (ps.health !== undefined) s.health = ps.health;
+      if (ps.maxHealth !== undefined) s.maxHealth = ps.maxHealth;
+      if (ps.armour !== undefined) s.armour = ps.armour;
+      else if (ps.armor !== undefined) s.armour = ps.armor;
+      if (ps.regen !== undefined) s.regen = !!ps.regen;
+      if (ps.move !== undefined) s.move = ps.move;
+      if (ps.sprint !== undefined) s.sprint = !!ps.sprint;
+      if (ps.crouch !== undefined) s.crouch = !!ps.crouch;
+      if (ps.ads !== undefined) s.ads = !!ps.ads;
+      if (ps.airborne !== undefined) s.airborne = !!ps.airborne;
+    } else if (player && typeof player.health === 'number') {
+      s.health = player.health;
+    }
+
+    // ---- movement-derived reticle bloom (works with any player system) ----
+    const pos = this._playerPos();
+    if (!ps && !s.simulate) {
+      this._dir.copy(pos).sub(this._prevPos);
+      this._dir.y = 0;
+      const speed = dt > 0 ? this._dir.length() / dt : 0;
+      s.move = damp(s.move, clamp01(speed / 6.2), 12, Math.max(rawDt, 1e-3));
+      if (!this._weaponState()) s.ads = ctx.input.ads && ctx.input.enabled;
+    }
+    this._prevPos.copy(pos);
+
+    // ---- health regeneration when nobody else owns health ----------------
+    if (!ps && !s.simulate && s.health < s.maxHealth) {
+      this._regenTimer += dt;
+      if (this._regenTimer > 4.5) {
+        if (!s.regen) {
+          s.regen = true;
+          this.health.onRegenStart();
+          this.sfx('regen', 0.4);
+        }
+        s.health = Math.min(s.maxHealth, s.health + dt * 24);
+      }
+    }
+
+    // ---- Command notices when Doug is in the red -------------------------
+    if (!s.simulate) {
+      const frac = s.maxHealth > 0 ? s.health / s.maxHealth : 1;
+      if (this._hurtArmed && frac > 0 && frac < HURT_RADIO_FRAC && this.ctx.peek('game')?.state === 'play') {
+        this._hurtArmed = false;
+        this.radio.say('hurt');
+      } else if (!this._hurtArmed && frac > 0.8) {
+        this._hurtArmed = true;
+      }
+    }
+
+    // ---- demo timeline ---------------------------------------------------
+    if (this.demo?.active) this.demo.update(this, dt);
+
+    // ---- ai blips --------------------------------------------------------
+    this._collectBlips();
+
+    // ---- front-end screen state -------------------------------------------
+    this._syncScreen(ctx);
+    if (this._screen === 'title') this._titleCamera(ctx, rawDt);
+
+    // ---- camera basis ----------------------------------------------------
+    const m = ctx.camera.matrixWorld.elements;
+    let rx = m[0];
+    let rz = m[2];
+    let fx = -m[8];
+    let fz = -m[10];
+    const rl = Math.hypot(rx, rz) || 1;
+    const fl = Math.hypot(fx, fz) || 1;
+    rx /= rl;
+    rz /= rl;
+    fx /= fl;
+    fz /= fl;
+    const heading = (Math.atan2(fx, -fz) * 180) / Math.PI;
+
+    // ---- widgets ---------------------------------------------------------
+    // Any front-end screen (title, DOUG IS DOWN, the report) owns the frame:
+    // killfeed, minimap, markers, score, vitals and ammo all fade to nothing in
+    // ~250 ms (damp rate 12 on unscaled time, so the death slow-mo does not
+    // stretch it). The damage vignette lives on hurtLayer and is untouched.
+    const screen = this._screen;
+    const titleScreen = screen === 'title';
+    const hudGoal = this.hudTarget * (this.menu.open ? 0.15 : 1) * (screen ? 0 : 1);
+    this.hudVisible = damp(this.hudVisible, hudGoal, screen ? 12 : 10, rawDt);
+    setStyle(this.chromeLayer, 'opacity', this.hudVisible.toFixed(3));
+    setStyle(this.worldLayer, 'opacity', this.hudVisible.toFixed(3));
+    setStyle(this.centreLayer, 'opacity', this.hudVisible.toFixed(3));
+    setStyle(this.radioLayer, 'opacity', titleScreen ? '0' : this.menu.open ? '0.3' : '1');
+
+    this.crosshair.update(dt, s);
+    this.hit.update(dt);
+    this.arcs.update(dt, rx, rz, fx, fz);
+    this.health.update(dt, s);
+    this.ammo.update(dt, s);
+    this.killfeed.update(dt);
+    this.runBar.update(dt, s);
+    this.prompt.update(dt);
+    this.banner.update(dt);
+    this.scorePop.update(dt);
+    this.radio.update(rawDt);
+
+    // Meta-screens fade on UNSCALED time so they still animate while paused/dead.
+    this.attract.update(rawDt);
+    this.death.update(rawDt);
+    this.over.update(rawDt);
+
+    this._buildCompassObjectives(pos);
+    this.compass.update(heading, this._compassObjs);
+
+    this.markers.updateObjectives(this._objectives, ctx.camera, this.vw, this.vh, this.k);
+    this.markers.updateGrenades(dt, ctx.camera, this.vw, this.vh, this.k);
+    this.markers.updateDamage(dt, ctx.camera, this.vw, this.vh, this.k);
+
+    // ---- minimap ---------------------------------------------------------
+    if (!this.minimap.bakeDone && ++this._bakeFrame > 6 && this._bakeFrame % 20 === 0) {
+      this.minimap.tryBake(ctx);
+    }
+    this._blipView.length = this._blipCount;
+    for (let i = 0; i < this._blipCount; i++) this._blipView[i] = this._blips[i];
+    this._mmState = this._mmState ?? { x: 0, z: 0, heading: 0, fov: 80, blips: null, objectives: null };
+    this._mmState.x = pos.x;
+    this._mmState.z = pos.z;
+    this._mmState.heading = heading;
+    this._mmState.fov = ctx.camera.fov;
+    this._mmState.blips = this._blipView;
+    this._mmState.objectives = this._mmObjs ?? (this._mmObjs = []);
+    this._mmObjs.length = 0;
+    for (const o of this._objectives) {
+      if (!o.position) continue;
+      this._mmObjs.push(o._mm ?? (o._mm = { x: 0, z: 0, label: o.label }));
+      const last = this._mmObjs[this._mmObjs.length - 1];
+      last.x = o.position.x;
+      last.z = o.position.z;
+      last.label = o.label;
+    }
+    this.minimap.draw(this._mmState);
+  }
+
+  /**
+   * Contacts for the minimap.
+   *
+   * READ-ONLY view of `ai.agents` — the live Agent array. The two accessors
+   * this used to try, `ai.getHudActors()` and `ai.actors`, have never existed
+   * on AiSystem, so `Array.isArray(list)` was false on every frame and the
+   * minimap has been showing zero contacts outside demo mode since the fork.
+   * Nothing here mutates an agent: it copies four numbers per contact into the
+   * preallocated blip ring.
+   */
+  _collectBlips() {
+    if (this.demo?.active) return; // demo drives its own contacts
+    const list = this.ctx.peek('ai')?.agents;
+    if (!Array.isArray(list)) return;
+    let n = 0;
+    for (let i = 0; i < list.length && n < MAX_BLIPS; i++) {
+      const a = list[i];
+      if (!a || a.alive !== true) continue; // dead bodies linger in the array
+      const p = a.position;
+      if (!p) continue;
+      const b = this._blips[n++];
+      b.x = p.x;
+      b.z = p.z;
+      b.kind = a.friendly ? 'friend' : 'enemy';
+      // Agent yaw is radians about +Y with forward = (sin y, 0, cos y). The map
+      // wants the same north-up degrees the player arrow uses, which is
+      // atan2(forwardX, -forwardZ) — so run the agent's forward through the
+      // identical expression rather than trusting a raw radian-to-degree cast.
+      const y = a.yaw ?? 0;
+      b.heading = (Math.atan2(Math.sin(y), -Math.cos(y)) * 180) / Math.PI;
+    }
+    this._blipCount = n;
+  }
+
+  /**
+   * Publish which front-end screen owns the frame: `ui:screen {name}` with
+   * name 'title' | 'death' | 'report' | null, emitted on change only.
+   * src/weapons hides the first-person viewmodel on it. Until a subsystem
+   * claims that job (`weapons.setViewmodelHidden`), the UI falls back to
+   * hiding the whole view scene, which only ever holds the viewmodel.
+   */
+  _syncScreen(ctx) {
+    const name = this.attract.open ? 'title' : this.death.open ? 'death' : this.over.open ? 'report' : null;
+    if (name === this._screen) return;
+    const was = this._screen;
+    this._screen = name;
+    if (name === 'title' && was !== 'title') this._dolly = 0;
+    ctx.events.emit('ui:screen', { name });
+    const w = ctx.peek('weapons');
+    if (typeof w?.setViewmodelHidden === 'function') w.setViewmodelHidden(!!name);
+    else if (ctx.viewScene) ctx.viewScene.visible = !name;
+  }
+
+  /**
+   * Title backdrop: a composed, slow dolly down the main street instead of
+   * whatever the idle player camera is looking at. 0.3 m/s over 8 m, easing
+   * through each turnaround so it never visibly stops. Written after every
+   * update() and before render, so it simply wins the frame; deploying
+   * respawns the player, who takes the camera back.
+   */
+  _titleCamera(ctx, rawDt) {
+    const SPEED = 0.3;
+    const LEN = 8;
+    this._dolly = (this._dolly ?? 0) + rawDt * SPEED;
+    const period = LEN * 2;
+    const u = (this._dolly % period) / LEN; // 0..2
+    const lin = u <= 1 ? u : 2 - u;
+    const d = lin * lin * (3 - 2 * lin) * LEN; // smoothstep turnarounds
+    const cam = ctx.camera;
+    const o = TITLE_CAM.from;
+    const f = TITLE_CAM.dir;
+    cam.position.set(o[0] + f[0] * d, o[1] + f[1] * d, o[2] + f[2] * d);
+    this._tmp.set(cam.position.x + f[0] * 10, cam.position.y + f[1] * 10 + 0.18, cam.position.z + f[2] * 10);
+    cam.lookAt(this._tmp);
+    if (cam.fov !== TITLE_CAM.fov) {
+      cam.fov = TITLE_CAM.fov;
+      cam.updateProjectionMatrix();
+    }
+    cam.updateMatrixWorld();
+  }
+
+  _screenOpen() {
+    return this.attract.open || this.death.open || this.over.open;
+  }
+
+  _buildCompassObjectives(pos) {
+    const out = this._compassObjs;
+    out.length = 0;
+    for (const o of this._objectives) {
+      if (!o.position) continue;
+      const dx = o.position.x - pos.x;
+      const dz = o.position.z - pos.z;
+      const bearing = (Math.atan2(dx, -dz) * 180) / Math.PI;
+      out.push(o._cmp ?? (o._cmp = { bearing: 0, label: o.label, color: o.color }));
+      const last = out[out.length - 1];
+      last.bearing = bearing;
+      last.label = o.label;
+      last.color = o.color;
+    }
+    return out;
+  }
+
+  resize(w, h, ctx) {
+    this.vw = w;
+    this.vh = h;
+    this.k = clamp(h / 1080, 0.62, 2.4);
+    this.root.style.setProperty('--k', this.k.toFixed(4));
+    this.crosshair.setScale(this.k);
+    this.compass.setScale(this.k);
+    this.minimap.resize(this.k);
+  }
+
+  dispose() {
+    for (const off of this._unsubs) off();
+    this._unsubs.length = 0;
+    this.crosshair.dispose();
+    this.hit.dispose();
+    this.arcs.dispose();
+    this.health.dispose();
+    this.ammo.dispose();
+    this.killfeed.dispose();
+    this.compass.dispose();
+    this.runBar.dispose();
+    this.minimap.dispose();
+    this.markers.dispose();
+    this.prompt.dispose();
+    this.banner.dispose();
+    this.scorePop.dispose();
+    this.radio.dispose();
+    this.attract.dispose();
+    this.death.dispose();
+    this.over.dispose();
+    this.menu.dispose();
+    this.root.remove();
+    removeStyles();
+  }
+}
